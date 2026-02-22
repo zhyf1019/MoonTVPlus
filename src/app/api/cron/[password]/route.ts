@@ -54,11 +54,16 @@ export async function GET(
 }
 
 async function cronJob() {
+  // 先刷新配置，确保其他任务使用最新配置
   await refreshConfig();
-  await refreshAllLiveChannels();
-  await refreshOpenList();
-  await refreshRecordAndFavorites();
-  await checkAnimeSubscriptions();
+
+  // 其余任务并行执行
+  await Promise.all([
+    refreshAllLiveChannels(),
+    refreshOpenList(),
+    refreshRecordAndFavorites(),
+    checkAnimeSubscriptions(),
+  ]);
 }
 
 async function refreshAllLiveChannels() {
@@ -164,26 +169,28 @@ async function refreshRecordAndFavorites() {
       const key = `${source}+${id}`;
       let promise = detailCache.get(key);
       if (!promise) {
+        // 立即缓存Promise，避免并发时的竞态条件
         promise = fetchVideoDetail({
           source,
           id,
           fallbackTitle: fallbackTitle.trim(),
         })
           .then((detail) => {
-            // 成功时才缓存结果
-            const successPromise = Promise.resolve(detail);
-            detailCache.set(key, successPromise);
             return detail;
           })
           .catch((err) => {
             console.error(`获取视频详情失败 (${source}+${id}):`, err);
+            // 失败时从缓存中移除，下次可以重试
+            detailCache.delete(key);
             return null;
           });
+        detailCache.set(key, promise);
       }
       return promise;
     };
 
-    for (const user of users) {
+    // 处理单个用户的函数
+    const processUser = async (user: string) => {
       console.log(`开始处理用户: ${user}`);
       const storage = getStorage();
 
@@ -342,44 +349,54 @@ async function refreshRecordAndFavorites() {
 
         console.log(`收藏处理完成: ${processedFavorites}/${totalFavorites}`);
 
-        // 如果有更新，发送汇总邮件
+        // 如果有更新，异步发送汇总邮件（不阻塞主流程）
         if (userUpdates.length > 0) {
-          try {
-            const userEmail = storage.getUserEmail ? await storage.getUserEmail(user) : null;
-            const emailNotifications = storage.getEmailNotificationPreference
-              ? await storage.getEmailNotificationPreference(user)
-              : false;
+          (async () => {
+            try {
+              const userEmail = storage.getUserEmail ? await storage.getUserEmail(user) : null;
+              const emailNotifications = storage.getEmailNotificationPreference
+                ? await storage.getEmailNotificationPreference(user)
+                : false;
 
-            if (userEmail && emailNotifications) {
-              const config = await getConfig();
-              const emailConfig = config?.EmailConfig;
+              if (userEmail && emailNotifications) {
+                const config = await getConfig();
+                const emailConfig = config?.EmailConfig;
 
-              if (emailConfig?.enabled) {
-                const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
-                const siteName = config?.SiteConfig?.SiteName || 'MoonTVPlus';
+                if (emailConfig?.enabled) {
+                  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+                  const siteName = config?.SiteConfig?.SiteName || 'MoonTVPlus';
 
-                await EmailService.send(emailConfig, {
-                  to: userEmail,
-                  subject: `📺 收藏更新汇总 - ${userUpdates.length} 部影片有更新`,
-                  html: getBatchFavoriteUpdateEmailTemplate(
-                    user,
-                    userUpdates,
-                    siteUrl,
-                    siteName
-                  ),
-                });
+                  await EmailService.send(emailConfig, {
+                    to: userEmail,
+                    subject: `📺 收藏更新汇总 - ${userUpdates.length} 部影片有更新`,
+                    html: getBatchFavoriteUpdateEmailTemplate(
+                      user,
+                      userUpdates,
+                      siteUrl,
+                      siteName
+                    ),
+                  });
 
-                console.log(`邮件汇总已发送至: ${userEmail} (${userUpdates.length} 个更新)`);
+                  console.log(`邮件汇总已发送至: ${userEmail} (${userUpdates.length} 个更新)`);
+                }
               }
+            } catch (emailError) {
+              console.error(`发送邮件汇总失败 (${user}):`, emailError);
             }
-          } catch (emailError) {
-            console.error(`发送邮件汇总失败 (${user}):`, emailError);
-            // 邮件发送失败不影响主流程
-          }
+          })().catch(err => console.error(`邮件发送异步任务失败 (${user}):`, err));
         }
       } catch (err) {
         console.error(`获取用户收藏失败 (${user}):`, err);
       }
+    };
+
+    // 分批并行处理用户，避免并发过高
+    // 可通过环境变量 CRON_USER_BATCH_SIZE 配置批处理大小，默认为 3
+    const BATCH_SIZE = parseInt(process.env.CRON_USER_BATCH_SIZE || '3', 10);
+    for (let i = 0; i < users.length; i += BATCH_SIZE) {
+      const batch = users.slice(i, i + BATCH_SIZE);
+      console.log(`处理用户批次 ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)}: ${batch.join(', ')}`);
+      await Promise.all(batch.map(user => processUser(user)));
     }
 
     console.log('刷新播放记录/收藏任务完成');

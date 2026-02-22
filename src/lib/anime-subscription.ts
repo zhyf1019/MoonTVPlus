@@ -361,31 +361,51 @@ export async function checkSubscription(subscription: AnimeSubscription) {
  * 检查所有订阅（定时任务调用）
  */
 export async function checkAnimeSubscriptions() {
+  console.log('[AnimeSubscription] 开始检查动漫订阅');
+
   const config = await getConfig();
   const animeConfig = config.AnimeSubscriptionConfig;
 
   if (!animeConfig?.Enabled) {
+    console.log('[AnimeSubscription] 动漫订阅功能未启用，跳过检查');
     return;
   }
 
   const subscriptions = animeConfig.Subscriptions || [];
+  console.log(`[AnimeSubscription] 共有 ${subscriptions.length} 个订阅`);
+
   const now = Date.now();
   const MIN_CHECK_INTERVAL = 30 * 60 * 1000; // 30分钟
   let configChanged = false;
+  let checkedCount = 0;
+  let skippedCount = 0;
+  let errorCount = 0;
 
   for (const sub of subscriptions) {
-    if (!sub.enabled) continue;
+    if (!sub.enabled) {
+      console.log(`[AnimeSubscription] 跳过已禁用的订阅: ${sub.title}`);
+      skippedCount++;
+      continue;
+    }
 
     // 检查是否距离上次检查超过30分钟
-    if (now - sub.lastCheckTime < MIN_CHECK_INTERVAL) {
+    const timeSinceLastCheck = now - sub.lastCheckTime;
+    if (timeSinceLastCheck < MIN_CHECK_INTERVAL) {
+      const remainingMinutes = Math.ceil((MIN_CHECK_INTERVAL - timeSinceLastCheck) / 60000);
+      console.log(`[AnimeSubscription] 跳过 ${sub.title}: 距离上次检查仅 ${Math.floor(timeSinceLastCheck / 60000)} 分钟，还需等待 ${remainingMinutes} 分钟`);
+      skippedCount++;
       continue;
     }
 
     try {
-      await checkSubscription(sub);
+      console.log(`[AnimeSubscription] 检查订阅: ${sub.title} (源: ${sub.source}, 上次集数: ${sub.lastEpisode})`);
+      const result = await checkSubscription(sub);
+      console.log(`[AnimeSubscription] ${sub.title}: 找到 ${result.found} 个新集数，成功下载 ${result.downloaded} 个`);
       configChanged = true;
+      checkedCount++;
     } catch (error) {
       console.error(`[AnimeSubscription] ${sub.title}: 检查失败`, error);
+      errorCount++;
     }
   }
 
@@ -393,5 +413,8 @@ export async function checkAnimeSubscriptions() {
   if (configChanged) {
     await db.saveAdminConfig(config);
     await setCachedConfig(config);
+    console.log('[AnimeSubscription] 配置已更新并保存');
   }
+
+  console.log(`[AnimeSubscription] 检查完成 - 总计: ${subscriptions.length}, 已检查: ${checkedCount}, 跳过: ${skippedCount}, 失败: ${errorCount}`);
 }
